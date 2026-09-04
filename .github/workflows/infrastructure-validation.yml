@@ -1,0 +1,28 @@
+name: Infrastructure Validation
+
+on:
+  pull_request:
+    branches: [develop, main]
+    paths:
+      - "k8s-aks/**"
+
+jobs:
+  validate-manifests:
+    name: Validate Kubernetes manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kubeconform
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz | tar xz
+          sudo mv kubeconform /usr/local/bin/
+
+      - name: Validate against Kubernetes schemas
+        run: kubeconform -strict -summary k8s-aks/*.yaml
+
+      - name: Dry-run diff (informational)
+        run: |
+          echo "Manifest validation passed. A real cluster dry-run"
+          echo "(kubectl apply --dry-run=server) requires cluster"
+          echo "credentials and runs only on the deploy job in main."

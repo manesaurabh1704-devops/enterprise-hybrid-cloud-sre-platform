@@ -1,0 +1,68 @@
+// ============================================================================
+// performance.kql
+// Latency percentile queries (P50/P95/P99) — exercised via the app's
+// /api/slow?delay=N endpoint for demo purposes.
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// 1. Response time percentiles from IIS logs (time-taken field, in ms)
+// ----------------------------------------------------------------------------
+W3CIISLog
+| where sSiteName == "PlatformAPI"
+| summarize
+    P50 = percentile(timeTaken, 50),
+    P95 = percentile(timeTaken, 95),
+    P99 = percentile(timeTaken, 99)
+    by bin(TimeGenerated, 5m)
+| order by TimeGenerated desc
+
+// ----------------------------------------------------------------------------
+// 2. Response time percentiles from app-level logs.
+// app.py's after_request hook logs a "Request completed" line with a
+// duration_ms field for every request — this is the primary latency
+// source for the AKS workload (IIS query above covers the Windows side).
+// ----------------------------------------------------------------------------
+ContainerLogV2
+| where ContainerName == "platform-api"
+| extend parsed = parse_json(LogMessage)
+| where isnotnull(parsed.duration_ms)
+| summarize
+    P50 = percentile(todouble(parsed.duration_ms), 50),
+    P95 = percentile(todouble(parsed.duration_ms), 95),
+    P99 = percentile(todouble(parsed.duration_ms), 99)
+    by bin(TimeGenerated, 5m)
+| order by TimeGenerated desc
+
+// ----------------------------------------------------------------------------
+// 3. Latency SLO breach alert query
+// Alert if P95 exceeds 500ms for 3 consecutive 5-minute windows.
+// ----------------------------------------------------------------------------
+W3CIISLog
+| where sSiteName == "PlatformAPI"
+| summarize P95 = percentile(timeTaken, 95) by bin(TimeGenerated, 5m)
+| where P95 > 500
+| order by TimeGenerated desc
+
+// ----------------------------------------------------------------------------
+// 4. Slowest endpoints (which routes are dragging P95 up)
+// ----------------------------------------------------------------------------
+W3CIISLog
+| where sSiteName == "PlatformAPI"
+| summarize
+    RequestCount = count(),
+    AvgTimeTaken = avg(timeTaken),
+    P95 = percentile(timeTaken, 95)
+    by csUriStem
+| order by P95 desc
+
+// ----------------------------------------------------------------------------
+// 5. Node/pod resource pressure correlation (is high latency a CPU/memory
+// problem, or an application-logic problem?)
+// InsightsMetrics is populated by Container Insights.
+// ----------------------------------------------------------------------------
+InsightsMetrics
+| where Namespace == "container.azm.ms/kubestate"
+| where Name == "cpuUsageNanoCores" or Name == "memoryWorkingSetBytes"
+| where Tags has "platform-api"
+| summarize avg(Val) by Name, bin(TimeGenerated, 5m)
+| order by TimeGenerated desc

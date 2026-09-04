@@ -1,0 +1,148 @@
+name: CD Pipeline
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - "k8s-aks/**"
+      - ".github/workflows/cd-pipeline.yml"
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write   # required for OIDC federation to Azure
+  contents: read
+
+env:
+  AZURE_RESOURCE_GROUP: rg-platform-sre-prod
+  AKS_CLUSTER_NAME: aks-platform-sre
+  ACR_NAME: acrplatformsre
+  NAMESPACE: platform-api
+  IMAGE_NAME: platform-api
+
+jobs:
+  validate:
+    name: Validate manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kubeconform
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz | tar xz
+          sudo mv kubeconform /usr/local/bin/
+
+      - name: Validate Kubernetes manifests
+        run: kubeconform -strict -summary k8s-aks/*.yaml
+
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: app/Dockerfile
+
+      - name: Run app unit tests
+        working-directory: app
+        run: |
+          pip install -r requirements.txt
+          pytest tests/ -v
+
+  security-scan:
+    name: Security scan
+    needs: validate
+    uses: ./.github/workflows/security-scan.yml
+
+  build-and-push:
+    name: Build & push image
+    needs: security-scan
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: tag
+        run: echo "tag=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: ACR build & push
+        run: |
+          az acr build \
+            --registry $ACR_NAME \
+            --image $IMAGE_NAME:${{ steps.tag.outputs.tag }} \
+            --image $IMAGE_NAME:latest \
+            app/
+
+  deploy:
+    name: Deploy to AKS
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials \
+            --resource-group $AZURE_RESOURCE_GROUP \
+            --name $AKS_CLUSTER_NAME \
+            --overwrite-existing
+
+      - name: Apply base manifests
+        run: |
+          kubectl apply -f k8s-aks/namespace.yaml
+          kubectl apply -f k8s-aks/configmap.yaml
+          kubectl apply -f k8s-aks/service.yaml
+          kubectl apply -f k8s-aks/hpa.yaml
+          kubectl apply -f k8s-aks/pdb.yaml
+          kubectl apply -f k8s-aks/network-policy.yaml
+
+      - name: Set new image
+        run: |
+          kubectl set image deployment/platform-api \
+            platform-api=$ACR_NAME.azurecr.io/$IMAGE_NAME:${{ needs.build-and-push.outputs.image_tag }} \
+            -n $NAMESPACE --record
+
+      - name: Apply deployment (in case of first run)
+        run: kubectl apply -f k8s-aks/deployment.yaml -n $NAMESPACE
+
+      # --------------------------------------------------------------
+      # This is the step that turns "we deployed" into "we deployed
+      # successfully". kubectl rollout status blocks until the new
+      # ReplicaSet is fully available AND passing readiness, or times
+      # out. A deploy is not "done" just because kubectl apply exited 0.
+      # --------------------------------------------------------------
+      - name: Wait for rollout to stabilize
+        id: rollout
+        continue-on-error: true
+        run: |
+          kubectl rollout status deployment/platform-api \
+            -n $NAMESPACE --timeout=180s
+
+      - name: Rollback on failed rollout
+        if: steps.rollout.outcome == 'failure'
+        run: |
+          echo "::error::Rollout did not stabilize within timeout — rolling back"
+          kubectl rollout undo deployment/platform-api -n $NAMESPACE
+          kubectl rollout status deployment/platform-api -n $NAMESPACE --timeout=120s
+          exit 1
+
+      - name: Post-deploy health check
+        if: steps.rollout.outcome == 'success'
+        run: |
+          kubectl run curl-healthcheck --rm -i --restart=Never \
+            --image=curlimages/curl -n $NAMESPACE -- \
+            curl -sf http://platform-api.platform-api.svc.cluster.local/health

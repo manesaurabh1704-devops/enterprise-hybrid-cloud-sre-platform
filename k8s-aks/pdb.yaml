@@ -1,0 +1,12 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: platform-api
+  namespace: platform-api
+spec:
+  # During voluntary disruptions (node drain, cluster upgrade), never let
+  # fewer than 2 pods be available at once.
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: platform-api

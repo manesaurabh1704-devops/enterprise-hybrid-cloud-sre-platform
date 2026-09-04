@@ -1,0 +1,84 @@
+// ============================================================================
+// incident-queries.kql
+// Detection queries for the incidents simulated in ../incidents/*.md
+// Data source: Log Analytics workspace with Container Insights enabled on
+// AKS (ContainerLogV2, KubePodInventory, KubeEvents tables).
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// 1. HTTP 5xx spike detection (from the app's structured JSON logs)
+// The Flask app logs {"level":"ERROR","message":"Simulated failure triggered..."}
+// on every /api/failure 500. ContainerLogV2's LogMessage is the raw stdout line;
+// parse_json pulls out the structured fields.
+// ----------------------------------------------------------------------------
+ContainerLogV2
+| where ContainerName == "platform-api"
+| extend parsed = parse_json(LogMessage)
+| where tostring(parsed.level) == "ERROR"
+| summarize ErrorCount = count() by bin(TimeGenerated, 5m)
+| where ErrorCount > 5   // tune threshold based on real traffic baseline
+| order by TimeGenerated desc
+
+// ----------------------------------------------------------------------------
+// 2. Error rate as a percentage of total requests
+// Requires the app to log every request (see @app.before_request in app.py)
+// so total request volume can be derived alongside errors.
+// ----------------------------------------------------------------------------
+ContainerLogV2
+| where ContainerName == "platform-api"
+| extend parsed = parse_json(LogMessage)
+| summarize
+    TotalLogLines = count(),
+    ErrorLogLines = countif(tostring(parsed.level) == "ERROR")
+    by bin(TimeGenerated, 5m)
+| extend ErrorRatePct = round(100.0 * ErrorLogLines / TotalLogLines, 2)
+| where ErrorRatePct > 5
+| order by TimeGenerated desc
+
+// ----------------------------------------------------------------------------
+// 3. CrashLoopBackOff detection (Incident INC-001)
+// KubePodInventory reports pod phase and container restart counts.
+// ----------------------------------------------------------------------------
+KubePodInventory
+| where Namespace == "platform-api"
+| where PodStatus != "Running" or ContainerRestartCount > 3
+| summarize
+    LatestStatus = arg_max(TimeGenerated, PodStatus, ContainerRestartCount)
+    by Name
+| where LatestStatus_ContainerRestartCount > 3
+| project Name, LatestStatus_PodStatus, LatestStatus_ContainerRestartCount, LatestStatus_TimeGenerated
+
+// ----------------------------------------------------------------------------
+// 4. Kubernetes events for a crashing pod (root-cause detail)
+// Run this immediately after query 3 identifies a pod name.
+// ----------------------------------------------------------------------------
+KubeEvents
+| where Namespace == "platform-api"
+// | where Name contains "platform-api-xxxxx"   // uncomment, fill in pod name from query 3
+| where Reason in ("BackOff", "Failed", "Unhealthy", "FailedScheduling")
+| project TimeGenerated, Name, Reason, Message
+| order by TimeGenerated desc
+
+// ----------------------------------------------------------------------------
+// 5. Readiness probe failures (Incident INC-005 / rollback trigger)
+// Unhealthy events specifically from readiness probe failures.
+// ----------------------------------------------------------------------------
+KubeEvents
+| where Namespace == "platform-api"
+| where Reason == "Unhealthy"
+| where Message has "Readiness probe failed"
+| summarize FailureCount = count() by Name, bin(TimeGenerated, 5m)
+| where FailureCount >= 3
+| order by TimeGenerated desc
+
+// ----------------------------------------------------------------------------
+// 6. Deployment rollback correlation
+// Cross-reference a rollback (visible as a new ReplicaSet scale-down/up
+// pattern) with the readiness failures that triggered it.
+// ----------------------------------------------------------------------------
+KubePodInventory
+| where Namespace == "platform-api"
+| summarize PodCount = dcount(Name) by ControllerName = ReplicaSetName, bin(TimeGenerated, 2m)
+| order by TimeGenerated asc
+// A rollback shows as: ReplicaSet A count drops to 0 shortly after
+// ReplicaSet B (the failed version) briefly appeared and was scaled down.

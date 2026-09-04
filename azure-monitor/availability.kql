@@ -1,0 +1,56 @@
+// ============================================================================
+// availability.kql
+// Availability / uptime queries across AKS and IIS.
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// 1. Pod availability over time (is the desired replica count actually met?)
+// ----------------------------------------------------------------------------
+KubePodInventory
+| where Namespace == "platform-api"
+| where PodStatus == "Running"
+| summarize RunningPods = dcount(Name) by bin(TimeGenerated, 5m)
+| extend DesiredReplicas = 3   // matches deployment.yaml spec.replicas
+| extend AvailabilityPct = round(100.0 * RunningPods / DesiredReplicas, 1)
+| order by TimeGenerated desc
+
+// ----------------------------------------------------------------------------
+// 2. Successful health check ratio (app-level availability, not just pod
+// existing — a Running pod can still be failing /health)
+// ----------------------------------------------------------------------------
+ContainerLogV2
+| where ContainerName == "platform-api"
+| extend parsed = parse_json(LogMessage)
+| where tostring(parsed.message) has "Health check"
+| summarize
+    Total = count(),
+    Successful = countif(tostring(parsed.message) has "successful")
+    by bin(TimeGenerated, 15m)
+| extend AvailabilityPct = round(100.0 * Successful / Total, 2)
+| order by TimeGenerated desc
+
+// ----------------------------------------------------------------------------
+// 3. IIS availability (via W3C IIS logs ingested through Azure Monitor Agent
+// / Data Collection Rule into the W3CIISLog table)
+// ----------------------------------------------------------------------------
+W3CIISLog
+| where sSiteName == "PlatformAPI"
+| summarize
+    TotalRequests = count(),
+    ServerErrors = countif(scStatus >= 500)
+    by bin(TimeGenerated, 5m)
+| extend AvailabilityPct = round(100.0 * (TotalRequests - ServerErrors) / TotalRequests, 2)
+| order by TimeGenerated desc
+
+// ----------------------------------------------------------------------------
+// 4. Monthly SLA-style rollup (e.g. "99.9% target")
+// ----------------------------------------------------------------------------
+ContainerLogV2
+| where ContainerName == "platform-api"
+| extend parsed = parse_json(LogMessage)
+| where tostring(parsed.message) has "Health check"
+| summarize
+    Total = count(),
+    Successful = countif(tostring(parsed.message) has "successful")
+    by bin(TimeGenerated, 30d)
+| extend MonthlyAvailabilityPct = round(100.0 * Successful / Total, 3)

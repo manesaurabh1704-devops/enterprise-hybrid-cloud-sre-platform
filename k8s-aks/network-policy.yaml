@@ -1,0 +1,38 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: platform-api-policy
+  namespace: platform-api
+spec:
+  podSelector:
+    matchLabels:
+      app: platform-api
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Only allow traffic that came through the Service (same namespace).
+    # In a real cluster, replace with an ingress-controller namespace
+    # selector once one is in front of this Service.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: platform-api
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    # DNS
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # HTTPS out (Azure Monitor, ACR pulls, external deps)
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 443

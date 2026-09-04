@@ -1,0 +1,53 @@
+name: Security Scan
+
+on:
+  workflow_call: {}
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - "app/**"
+      - "k8s-aks/**"
+
+jobs:
+  trivy-fs-scan:
+    name: Trivy filesystem & dependency scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner (filesystem)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          scan-ref: app/
+          severity: CRITICAL,HIGH
+          exit-code: 1
+          format: table
+
+  trivy-config-scan:
+    name: Trivy IaC / Kubernetes manifest scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy config scanner (k8s manifests + Dockerfile)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: config
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          exit-code: 1
+          format: table
+
+  gitleaks:
+    name: Secret scanning
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
