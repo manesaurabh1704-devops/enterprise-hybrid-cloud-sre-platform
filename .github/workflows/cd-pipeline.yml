@@ -10,13 +10,13 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  id-token: write   # required for OIDC federation to Azure
+  id-token: write
   contents: read
 
 env:
-  AZURE_RESOURCE_GROUP: rg-platform-sre-prod
-  AKS_CLUSTER_NAME: aks-platform-sre
-  ACR_NAME: acrplatformsre
+  AZURE_RESOURCE_GROUP: rg-cloud-sre-platform
+  AKS_CLUSTER_NAME: aks-cloud-sre-platform-01
+  ACR_NAME: acrcloudsreplatform01
   NAMESPACE: platform-api
   IMAGE_NAME: platform-api
 
@@ -24,6 +24,7 @@ jobs:
   validate:
     name: Validate manifests
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -55,12 +56,14 @@ jobs:
     name: Build & push image
     needs: security-scan
     runs-on: ubuntu-latest
+
     outputs:
       image_tag: ${{ steps.tag.outputs.tag }}
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set image tag
+      - name: Set immutable image tag
         id: tag
         run: echo "tag=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
 
@@ -71,19 +74,26 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: ACR build & push
+      - name: Login to Azure Container Registry
+        run: az acr login --name "$ACR_NAME"
+
+      - name: Build and push Docker image
         run: |
-          az acr build \
-            --registry $ACR_NAME \
-            --image $IMAGE_NAME:${{ steps.tag.outputs.tag }} \
-            --image $IMAGE_NAME:latest \
+          IMAGE="$ACR_NAME.azurecr.io/$IMAGE_NAME:${{ steps.tag.outputs.tag }}"
+
+          docker build \
+            --file app/Dockerfile \
+            --tag "$IMAGE" \
             app/
+
+          docker push "$IMAGE"
 
   deploy:
     name: Deploy to AKS
     needs: build-and-push
     runs-on: ubuntu-latest
     environment: production
+
     steps:
       - uses: actions/checkout@v4
 
@@ -94,55 +104,72 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
+      - name: Install kubectl and kubelogin
+        run: az aks install-cli
+
       - name: Get AKS credentials
         run: |
           az aks get-credentials \
-            --resource-group $AZURE_RESOURCE_GROUP \
-            --name $AKS_CLUSTER_NAME \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$AKS_CLUSTER_NAME" \
             --overwrite-existing
+
+          kubelogin convert-kubeconfig -l azurecli
+
+      - name: Verify AKS access
+        run: |
+          kubectl auth can-i get pods -n "$NAMESPACE"
+          kubectl auth can-i create deployments -n "$NAMESPACE"
+
+      - name: Verify required application secret
+        run: |
+          kubectl get secret platform-api-secret -n "$NAMESPACE"
 
       - name: Apply base manifests
         run: |
-          kubectl apply -f k8s-aks/namespace.yaml
           kubectl apply -f k8s-aks/configmap.yaml
           kubectl apply -f k8s-aks/service.yaml
           kubectl apply -f k8s-aks/hpa.yaml
           kubectl apply -f k8s-aks/pdb.yaml
           kubectl apply -f k8s-aks/network-policy.yaml
 
-      - name: Set new image
+      - name: Render and apply immutable deployment
         run: |
-          kubectl set image deployment/platform-api \
-            platform-api=$ACR_NAME.azurecr.io/$IMAGE_NAME:${{ needs.build-and-push.outputs.image_tag }} \
-            -n $NAMESPACE --record
+          IMAGE="$ACR_NAME.azurecr.io/$IMAGE_NAME:${{ needs.build-and-push.outputs.image_tag }}"
 
-      - name: Apply deployment (in case of first run)
-        run: kubectl apply -f k8s-aks/deployment.yaml -n $NAMESPACE
+          sed "s#<ACR_NAME>.azurecr.io/platform-api:latest#$IMAGE#" \
+            k8s-aks/deployment.yaml | kubectl apply -f -
 
-      # --------------------------------------------------------------
-      # This is the step that turns "we deployed" into "we deployed
-      # successfully". kubectl rollout status blocks until the new
-      # ReplicaSet is fully available AND passing readiness, or times
-      # out. A deploy is not "done" just because kubectl apply exited 0.
-      # --------------------------------------------------------------
       - name: Wait for rollout to stabilize
         id: rollout
         continue-on-error: true
         run: |
           kubectl rollout status deployment/platform-api \
-            -n $NAMESPACE --timeout=180s
+            -n "$NAMESPACE" \
+            --timeout=180s
 
       - name: Rollback on failed rollout
         if: steps.rollout.outcome == 'failure'
         run: |
           echo "::error::Rollout did not stabilize within timeout — rolling back"
-          kubectl rollout undo deployment/platform-api -n $NAMESPACE
-          kubectl rollout status deployment/platform-api -n $NAMESPACE --timeout=120s
+
+          kubectl rollout undo deployment/platform-api \
+            -n "$NAMESPACE"
+
+          kubectl rollout status deployment/platform-api \
+            -n "$NAMESPACE" \
+            --timeout=120s
+
           exit 1
 
       - name: Post-deploy health check
         if: steps.rollout.outcome == 'success'
         run: |
-          kubectl run curl-healthcheck --rm -i --restart=Never \
-            --image=curlimages/curl -n $NAMESPACE -- \
+          kubectl run curl-healthcheck \
+            --rm \
+            -i \
+            --restart=Never \
+            --image=curlimages/curl \
+            -n "$NAMESPACE" \
+            -- \
             curl -sf http://platform-api.platform-api.svc.cluster.local/health
